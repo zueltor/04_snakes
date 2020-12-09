@@ -6,7 +6,7 @@ public class GamePlayer {
     public int id;
     public String name;
     public int score;
-    public String stringAddress = "";
+    public String stringAddress;
     public int port;
     public SnakesProto.NodeRole role;
 

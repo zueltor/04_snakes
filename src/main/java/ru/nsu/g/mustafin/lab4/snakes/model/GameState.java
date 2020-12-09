@@ -1,13 +1,12 @@
 package ru.nsu.g.mustafin.lab4.snakes.model;
 
-import ru.nsu.g.mustafin.lab4.snakes.GamePanel;
 import ru.nsu.g.mustafin.lab4.snakes.SnakesProto;
 
 import java.util.ArrayList;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class GameState {
-    public ArrayList<GamePanel.Snake> snakes;
+    public ArrayList<Snake> snakes;
     public ArrayList<Coordinates> apples;
     public ConcurrentHashMap<Integer, GamePlayer> players;
     public GameConfig config;
@@ -21,7 +20,7 @@ public class GameState {
         this.state_order = 1;
     }
 
-    public GameState(ArrayList<GamePanel.Snake> snakes, ArrayList<Coordinates> apples, ConcurrentHashMap<Integer, GamePlayer> players, GameConfig config, int state_order) {
+    public GameState(ArrayList<Snake> snakes, ArrayList<Coordinates> apples, ConcurrentHashMap<Integer, GamePlayer> players, GameConfig config, int state_order) {
         this.snakes = snakes;
         this.apples = apples;
         this.players = players;

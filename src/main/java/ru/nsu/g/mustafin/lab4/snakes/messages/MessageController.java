@@ -1,7 +1,8 @@
 package ru.nsu.g.mustafin.lab4.snakes.messages;
 
 import com.google.protobuf.InvalidProtocolBufferException;
-import ru.nsu.g.mustafin.lab4.snakes.GamePanel;
+import ru.nsu.g.mustafin.lab4.snakes.model.GamePanel;
+import ru.nsu.g.mustafin.lab4.snakes.model.Snake;
 import ru.nsu.g.mustafin.lab4.snakes.SnakesProto;
 import ru.nsu.g.mustafin.lab4.snakes.gui.MenuFrame;
 import ru.nsu.g.mustafin.lab4.snakes.model.Coordinates;
@@ -32,10 +33,8 @@ public class MessageController implements AutoCloseable {
     private GamePanel gamePanel;
     private static final int BUFFER_SIZE = 2048;
     private static final int MESSAGE_EXPIRATION_TIME = 1000;
-    private final byte[] buffer;
-    private final MulticastSocket announcementSendSocket;
-    private final MulticastSocket announcementReceiveSocket;
-    private final DatagramSocket socket;
+    private final MulticastSocket announcementSocket;
+    private final MulticastSocket socket;
     private final ConcurrentHashMap<Player, Long> players = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, Player> playersById = new ConcurrentHashMap<>();
     private long sequence_number = 1;
@@ -49,12 +48,11 @@ public class MessageController implements AutoCloseable {
     private final ConcurrentHashMap<Game, Long> games;
     private GameState previousGameState;
 
-    public MessageController(int port, String address, MenuFrame menuFrame) throws IOException {
+    public MessageController(int port, String address, NetworkInterface netif, MenuFrame menuFrame) throws IOException {
         this.port = port;
         this.group = InetAddress.getByName(address);
-        this.socket = new DatagramSocket();
+        this.socket = new MulticastSocket();
         this.games = new ConcurrentHashMap<>();
-
         this.announcementReceiver = new Thread(new AnnouncementReceiver());
         this.announcementSender = new Thread(new AnnouncementSender());
         this.threads.add(new Thread(new Sender()));
@@ -62,12 +60,10 @@ public class MessageController implements AutoCloseable {
         this.threads.add(new Thread(new MessageUpdater()));
         this.threads.add(new Thread(new PingMessageSender()));
         this.threads.add(new Thread(new PlayersChecker()));
-
-        this.buffer = new byte[2048];
-
-        this.announcementSendSocket = new MulticastSocket(port);
-        this.announcementReceiveSocket = this.announcementSendSocket;//new MulticastSocket(port);
-        this.announcementReceiveSocket.joinGroup(this.group);
+        this.announcementSocket = new MulticastSocket(port);
+        var isa = new InetSocketAddress(this.group, port);
+        this.announcementSocket.joinGroup(isa, netif);
+        this.socket.setNetworkInterface(netif);
         this.menuFrame = menuFrame;
     }
 
@@ -101,7 +97,6 @@ public class MessageController implements AutoCloseable {
                 .build().toByteArray();
         this.id_message_sequence_number = this.sequence_number++;
         this.messageQueue.add(new Message(null, bytes));
-        System.out.println("Sent join message " + this.id_message_sequence_number);
         for (var thread : this.threads) {
             thread.start();
         }
@@ -109,7 +104,6 @@ public class MessageController implements AutoCloseable {
     }
 
     public void sendSteerMessage(SnakesProto.Direction direction) {
-        System.out.println("Send steer " + this.sequence_number + " " + direction);
         var bytes = SnakesProto.GameMessage.newBuilder()
                 .setMsgSeq(this.sequence_number++)
                 .setSenderId(this.id)
@@ -121,17 +115,6 @@ public class MessageController implements AutoCloseable {
 
     public int getPort() {
         return this.socket.getPort();
-    }
-
-    @Override
-    public void close() {
-        this.announcementSender.interrupt();
-        this.announcementReceiver.interrupt();
-        this.announcementSendSocket.close();
-        for (var thread : this.threads) {
-            thread.interrupt();
-        }
-        this.socket.close();
     }
 
     public void sendRoleChangeMsg(Player player, SnakesProto.NodeRole receiverRole, SnakesProto.NodeRole senderRole) {
@@ -146,7 +129,6 @@ public class MessageController implements AutoCloseable {
                 .setSenderId(this.id)
                 .setReceiverId(receiverId)
                 .build().toByteArray();
-        System.out.println("Send role change " + this.id + " " + senderRole + " " + receiverId + " " + receiverRole);
         this.messageQueue.add(new Message(player, bytes));
     }
 
@@ -162,7 +144,7 @@ public class MessageController implements AutoCloseable {
         }
         for (var snake : gameState.snakes) {
             var snakeBuilder = SnakesProto.GameState.Snake.newBuilder();
-            for (var coord : snake.snakeOffsets) {
+            for (var coord : snake.offsets) {
                 snakeBuilder.addPoints(SnakesProto.GameState.Coord.newBuilder()
                         .setX(coord.x)
                         .setY(coord.y)
@@ -201,6 +183,18 @@ public class MessageController implements AutoCloseable {
                 .setNodeTimeoutMs(gameState.config.node_timeout_ms).build();
     }
 
+    private void findNewDeputy() {
+        for (var p : MessageController.this.players.keySet()) {
+            if (p.getRole() == SnakesProto.NodeRole.NORMAL) {
+                p.setRole(SnakesProto.NodeRole.DEPUTY);
+                MessageController.this.sendRoleChangeMsg(p, SnakesProto.NodeRole.DEPUTY, MessageController.this.myRole);
+                MessageController.this.playersById.get(p.getId()).setRole(SnakesProto.NodeRole.DEPUTY);
+                MessageController.this.gamePanel.changePlayerRole(p.getId(), SnakesProto.NodeRole.DEPUTY);
+                break;
+            }
+        }
+    }
+
     private SnakesProto.GamePlayers buildGamePlayers(GameState gameState) {
         var playersBuilder = SnakesProto.GamePlayers.newBuilder();
         for (var player : gameState.players.values()) {
@@ -214,6 +208,31 @@ public class MessageController implements AutoCloseable {
                     .build());
         }
         return playersBuilder.build();
+    }
+
+    private void setNewMaster(GamePlayer player) {
+        var masterSocketAddress = new InetSocketAddress(player.stringAddress, player.port);
+        var newPlayer = new Player(masterSocketAddress);
+        newPlayer.setRole(SnakesProto.NodeRole.MASTER);
+        newPlayer.setId(player.id);
+        MessageController.this.players.clear();
+        MessageController.this.players.put(newPlayer, System.currentTimeMillis());
+        MessageController.this.master = newPlayer;
+    }
+
+    public void setId(int id) {
+        this.id = id;
+    }
+
+    @Override
+    public void close() {
+        this.announcementSender.interrupt();
+        this.announcementReceiver.interrupt();
+        for (var thread : this.threads) {
+            thread.interrupt();
+        }
+        this.socket.close();
+        this.announcementSocket.close();
     }
 
     class PlayersChecker implements Runnable {
@@ -237,26 +256,15 @@ public class MessageController implements AutoCloseable {
                 if (timedOutPlayer != null) {
                     MessageController.this.players.remove(timedOutPlayer);
                     int playerId = timedOutPlayer.getId();
-                    System.out.println("Player " + timedOutPlayer.getRole() + " died");
                     MessageController.this.playersById.remove(playerId);
                     MessageController.this.gamePanel.removePlayer(playerId);
 
                     //b
                     if (MessageController.this.myRole == SnakesProto.NodeRole.MASTER && timedOutPlayer.getRole() == SnakesProto.NodeRole.DEPUTY) {
                         MessageController.this.players.remove(timedOutPlayer);
-                        for (var p : MessageController.this.players.keySet()) {
-                            if (p.getRole() == SnakesProto.NodeRole.NORMAL) {
-                                p.setRole(SnakesProto.NodeRole.DEPUTY);
-                                MessageController.this.sendRoleChangeMsg(p, SnakesProto.NodeRole.DEPUTY, MessageController.this.myRole);
-                                MessageController.this.playersById.get(p.getId()).setRole(SnakesProto.NodeRole.DEPUTY);
-                                MessageController.this.gamePanel.changePlayerRole(p.getId(), SnakesProto.NodeRole.DEPUTY);
-                                //todo
-                                break;
-                            }
-                        }
+                        MessageController.this.findNewDeputy();
                         //c
                     } else if (MessageController.this.myRole == SnakesProto.NodeRole.DEPUTY && timedOutPlayer.getRole() == SnakesProto.NodeRole.MASTER) {
-                        System.out.println("Becoming master " + MessageController.this.id);
                         MessageController.this.myRole = SnakesProto.NodeRole.MASTER;
                         MessageController.this.players.clear();
                         MessageController.this.playersById.clear();
@@ -299,18 +307,13 @@ public class MessageController implements AutoCloseable {
                                 continue;
                             }
                             if (player.role == SnakesProto.NodeRole.DEPUTY) {
-                                var inetSocketAddress = new InetSocketAddress(player.stringAddress, player.port);
-                                var newPlayer = new Player(inetSocketAddress);
-                                newPlayer.setRole(SnakesProto.NodeRole.MASTER);
-                                newPlayer.setId(player.id);
-                                MessageController.this.players.clear();
-                                MessageController.this.players.put(newPlayer, System.currentTimeMillis());
-                                MessageController.this.master = newPlayer;
+                                MessageController.this.setNewMaster(player);
                                 hasDeputy = true;
                                 break;
                             }
                         }
                         if (!hasDeputy) {
+                            MessageController.this.gamePanel.infoBox("No deputy, closing game","Error");
                             MessageController.this.gamePanel.close();
                         }
                     }
@@ -426,14 +429,13 @@ public class MessageController implements AutoCloseable {
                 }
             }
             if (message.hasJoin()) {
-                System.out.println("Join msg");
                 var joinMessage = message.getJoin();
                 SnakesProto.NodeRole role;
                 boolean hasDeputyNode = false;
                 for (var player : MessageController.this.players.keySet()) {
-                    player.getRole();
                     if (player.getRole().equals(SnakesProto.NodeRole.DEPUTY)) {
                         hasDeputyNode = true;
+                        break;
                     }
                 }
 
@@ -464,7 +466,6 @@ public class MessageController implements AutoCloseable {
                         .setSenderId(sender_id)
                         .setMsgSeq(message.getMsgSeq())
                         .build().toByteArray();
-                System.out.println("Recved join, id= " + receiver_id);
                 MessageController.this.messageQueue.add(new Message(dummyPlayer, ack));
             } else if (message.hasSteer()) {
                 var steerMessage = message.getSteer();
@@ -478,7 +479,6 @@ public class MessageController implements AutoCloseable {
                     MessageController.this.master.setId(MessageController.this.masterId);
                     MessageController.this.master.setRole(SnakesProto.NodeRole.MASTER);
                     MessageController.this.gamePanel.setPlayerId(MessageController.this.id);
-                    System.out.println("Recved ack, id=" + MessageController.this.id);
                 }
                 synchronized (MessageController.this.messagesToRemove) {
                     MessageController.this.messagesToRemove.add(messageSequenceNumber); //MessageUpdater will remove messages and clear this array
@@ -487,10 +487,9 @@ public class MessageController implements AutoCloseable {
                 var stateMessage = message.getState().getState();
                 var state_order = stateMessage.getStateOrder();
                 if (state_order < MessageController.this.currentStateOrder) {
-                    System.out.println("Old state");
                     return;
                 }
-                MessageController.this.currentStateOrder =state_order;
+                MessageController.this.currentStateOrder = state_order;
                 var configMessage = stateMessage.getConfig();
                 GameConfig config = new GameConfig(configMessage.getWidth(),
                         configMessage.getHeight(),
@@ -513,7 +512,7 @@ public class MessageController implements AutoCloseable {
                 }
                 var applesList = stateMessage.getFoodsList();
                 var snakesList = stateMessage.getSnakesList();
-                ArrayList<GamePanel.Snake> snakes = new ArrayList<>();
+                ArrayList<Snake> snakes = new ArrayList<>();
                 ArrayList<Coordinates> apples = new ArrayList<>();
                 for (var apple : applesList) {
                     apples.add(new Coordinates(apple.getX(), apple.getY()));
@@ -524,7 +523,7 @@ public class MessageController implements AutoCloseable {
                     for (SnakesProto.GameState.Coord coord : coordList) {
                         coordinates.add(new Coordinates(coord.getX(), coord.getY()));
                     }
-                    var _snake = new GamePanel.Snake(snake.getPlayerId(), snake.getState(), snake.getHeadDirection(), coordinates);
+                    var _snake = new Snake(snake.getPlayerId(), snake.getState(), snake.getHeadDirection(), coordinates);
                     snakes.add(_snake);
                 }
                 var gameState = new GameState(snakes, apples, players, config, state_order);
@@ -535,73 +534,43 @@ public class MessageController implements AutoCloseable {
             } else if (message.hasRoleChange()) {
                 int senderId = message.getSenderId();
                 var senderRole = message.getRoleChange().getSenderRole();
-                var receiverId = message.getReceiverId();
                 var receiverRole = message.getRoleChange().getReceiverRole();
-                System.out.println("Role change " + senderId + " " + senderRole + " " + receiverId + " " + receiverRole);
                 if (senderRole == SnakesProto.NodeRole.MASTER) {
                     MessageController.this.myRole = receiverRole;
                     if (senderId != MessageController.this.masterId) {
                         var player = MessageController.this.previousGameState.players.get(senderId);
-                        var masterSocketAddress = new InetSocketAddress(player.stringAddress, player.port);
-                        var newPlayer = new Player(masterSocketAddress);
-                        newPlayer.setRole(SnakesProto.NodeRole.MASTER);
-                        newPlayer.setId(player.id);
-                        MessageController.this.players.clear();
-                        MessageController.this.players.put(newPlayer, System.currentTimeMillis());
-                        MessageController.this.master = newPlayer;
+                        MessageController.this.setNewMaster(player);
                     }
                 } else if (receiverRole == SnakesProto.NodeRole.MASTER) {
                     if (MessageController.this.playersById.get(senderId).getRole() == SnakesProto.NodeRole.DEPUTY && senderRole != SnakesProto.NodeRole.DEPUTY) {
-                        for (var p : MessageController.this.players.keySet()) {
-                            if (p.getRole() == SnakesProto.NodeRole.NORMAL) {
-                                p.setRole(SnakesProto.NodeRole.DEPUTY);
-                                MessageController.this.sendRoleChangeMsg(p, SnakesProto.NodeRole.DEPUTY, MessageController.this.myRole);
-                                MessageController.this.playersById.get(p.getId()).setRole(SnakesProto.NodeRole.DEPUTY);
-                                MessageController.this.gamePanel.changePlayerRole(p.getId(), SnakesProto.NodeRole.DEPUTY);
-                                break;
-                            }
-                        }
+                        MessageController.this.findNewDeputy();
                     } else if (MessageController.this.playersById.get(senderId).getRole() == SnakesProto.NodeRole.VIEWER && senderRole == SnakesProto.NodeRole.NORMAL) {
                         boolean hasDeputy = false;
-                        int id_ = 0;
                         for (var p : MessageController.this.players.keySet()) {
                             if (p.getRole() == SnakesProto.NodeRole.DEPUTY) {
                                 hasDeputy = true;
-                                id_ = p.getId();
                                 break;
                             }
                         }
                         if (!hasDeputy) {
-                            System.out.println("Viewer to deputy");
                             senderRole = SnakesProto.NodeRole.DEPUTY;
-                        } else {
-                            System.out.println("Deputy is " + id_);
                         }
                     }
-                    System.out.println("Changing role to " + senderRole);
                     MessageController.this.playersById.get(senderId).setRole(senderRole);
                     MessageController.this.gamePanel.changePlayerRole(senderId, senderRole);
                 }
 
-            } else if (message.hasPing()) {
-
             } else if (message.hasError()) {
                 String error = message.getError().getErrorMessage();
-                System.out.println(error);
                 MessageController.this.gamePanel.infoBox(error, "Error");
                 MessageController.this.gamePanel.close();
-            } else {
-                System.out.println("Unknown msg");
+            } else if (!message.hasPing()) {
+                System.err.println("Unknown msg");
             }
         }
     }
 
-    public void setId(int id) {
-        this.id = id;
-    }
-
     class AnnouncementSender implements Runnable {
-
         @Override
         public void run() {
             while (!Thread.currentThread().isInterrupted()) {
@@ -633,7 +602,7 @@ public class MessageController implements AutoCloseable {
                             .build();
                     byte[] buf = announcementMsg.toByteArray();
                     final DatagramPacket packet = new DatagramPacket(buf, buf.length, MessageController.this.group, MessageController.this.port);
-                    MessageController.this.announcementSendSocket.send(packet);
+                    MessageController.this.socket.send(packet);
 
                     Thread.sleep(500);
                 } catch (final IOException | InterruptedException e) {
@@ -685,21 +654,20 @@ public class MessageController implements AutoCloseable {
                     current_time = System.currentTimeMillis();
                     if (next_check_time - current_time <= 0 || gameAdded) {
                         gameAdded = false;
-                        MessageController.this.games.entrySet().removeIf(entry -> System.currentTimeMillis() - entry.getValue() > UPDATE_GAMES_DELAY * 2);
+                        MessageController.this.games.entrySet().removeIf(entry -> System.currentTimeMillis() - entry.getValue() > UPDATE_GAMES_DELAY * 10);
                         MessageController.this.menuFrame.updateGamesList(new ArrayList<>(MessageController.this.games.keySet()));
                         current_time = System.currentTimeMillis();
                         next_check_time = UPDATE_GAMES_DELAY + current_time;
                     } else {
                         receive_timeout = next_check_time - current_time;
-                        MessageController.this.announcementReceiveSocket.setSoTimeout((int) receive_timeout);
+                        MessageController.this.announcementSocket.setSoTimeout((int) receive_timeout);
                         packet = new DatagramPacket(buffer, buffer.length);
-                        MessageController.this.announcementReceiveSocket.receive(packet);
+                        MessageController.this.announcementSocket.receive(packet);
 
                         try {
                             final var message = SnakesProto.GameMessage.parseFrom(Arrays.copyOf(packet.getData(), packet.getLength()));
                             if (message.hasAnnouncement()) {
                                 var announcementMessage = message.getAnnouncement();
-                                int index_master = 0;
                                 boolean hasMaster = false;
                                 Game game = new Game();
 
@@ -720,14 +688,14 @@ public class MessageController implements AutoCloseable {
                                     for (int i = 0; i < players.getPlayersCount(); i++) {
                                         var player = players.getPlayers(i);
                                         if (player.getRole() == SnakesProto.NodeRole.MASTER) {
-                                            index_master = i;
                                             hasMaster = true;
+                                            break;
                                         }
                                     }
                                     if (!hasMaster) {
                                         continue; //no master, no game
                                     }
-                                    game.inetSocketAddress = new InetSocketAddress(packet.getAddress(), players.getPlayers(index_master).getPort());
+                                    game.inetSocketAddress = new InetSocketAddress(packet.getAddress().getHostAddress(), packet.getPort());
                                     if (!MessageController.this.games.containsKey(game)) {
                                         gameAdded = true;
                                     }
@@ -746,5 +714,4 @@ public class MessageController implements AutoCloseable {
             }
         }
     }
-
 }
